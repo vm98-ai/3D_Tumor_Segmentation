@@ -33,7 +33,7 @@ def evaluate(checkpoint: str, output_dir: str = "seg3d_eval", mc_passes: int = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     roi_size = tuple(cfg["roi_size"])
 
-    val_files_path = Path(r"C:\Users\vm98a\AI\3D_Medical\data\val_goat.json")
+    val_files_path = ckpt_path / "val_goat.json"
     if not val_files_path.exists():
         raise FileNotFoundError(f"val_files.json not found in {ckpt_path.parent}. Run training first.")
     val_files = json.loads(val_files_path.read_text())
