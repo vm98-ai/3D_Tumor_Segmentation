@@ -230,10 +230,6 @@ class JEPA4DPretrainer(nn.Module):
         num_mask_blocks: int = 6,
         use_cross_modal: bool = True,
         cross_modal_weight: float = 0.25,
-        block_type: str = "attention",   # "attention" or "mamba"
-        mamba_d_state: int = 16,
-        mamba_d_conv: int = 4,
-        mamba_expand: int = 2,
     ):
         super().__init__()
         self.use_cross_modal = use_cross_modal
@@ -246,10 +242,6 @@ class JEPA4DPretrainer(nn.Module):
             embed_dim=embed_dim,
             depth=encoder_depth,
             num_heads=encoder_heads,
-            block_type=block_type,
-            mamba_d_state=mamba_d_state,
-            mamba_d_conv=mamba_d_conv,
-            mamba_expand=mamba_expand,
         )
         grid = self.encoder.patch_embed.grid_size
 
@@ -438,10 +430,6 @@ def pretrain(
     img_size: tuple = (128, 128, 128),
     use_cross_modal: bool = True,
     resume: Optional[str] = None,
-    block_type: str = "attention",   # "attention" or "mamba"
-    mamba_d_state: int = 16,
-    mamba_d_conv: int = 4,
-    mamba_expand: int = 2,
     cache_rate: float = 0.0,
     cache_dir: str = "monai_persistent_cache/pretrain",
     cache_mode: str = "precomputed",   # "precomputed" | "persistent" | "inmemory"
@@ -568,10 +556,6 @@ def pretrain(
         predictor_dim=embed_dim // 2,
         total_steps=total_steps,
         use_cross_modal=use_cross_modal,
-        block_type=block_type,
-        mamba_d_state=mamba_d_state,
-        mamba_d_conv=mamba_d_conv,
-        mamba_expand=mamba_expand,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -835,10 +819,6 @@ def finetune(
     img_size: tuple = (128, 128, 128),
     freeze_first_n: int = 6,
     num_workers: int = 4,
-    block_type: str = "attention",   # must match the pretrained encoder's block_type
-    mamba_d_state: int = 16,
-    mamba_d_conv: int = 4,
-    mamba_expand: int = 2,
     cache_rate: float = 0.0,
     train_cache_dir: str = "monai_persistent_cache/finetune_train",
     val_cache_dir: str = "monai_persistent_cache/finetune_val",
@@ -1002,8 +982,6 @@ def finetune(
     encoder = VisionTransformer3D(
         img_size=img_size, patch_size=patch_size,
         embed_dim=embed_dim, depth=encoder_depth, num_heads=encoder_heads,
-        block_type=block_type,
-        mamba_d_state=mamba_d_state, mamba_d_conv=mamba_d_conv, mamba_expand=mamba_expand,
     )
     ckpt = torch.load(pretrained_encoder, map_location="cpu")
     encoder.load_state_dict(ckpt)
@@ -1206,10 +1184,6 @@ if __name__ == "__main__":
     p1.add_argument("--lr", type=float, default=1.5e-4)
     p1.add_argument("--no_cross_modal", action="store_true")
     p1.add_argument("--resume", default=None)
-    p1.add_argument("--block_type", choices=["attention", "mamba"], default="attention")
-    p1.add_argument("--mamba_d_state", type=int, default=16)
-    p1.add_argument("--mamba_d_conv", type=int, default=4)
-    p1.add_argument("--mamba_expand", type=int, default=2)
     p1.add_argument("--num_workers", type=int, default=4)
     p1.add_argument("--cache_mode", choices=["precomputed", "persistent", "inmemory"],
                      default="precomputed",
@@ -1237,11 +1211,6 @@ if __name__ == "__main__":
     p2.add_argument("--encoder_heads", type=int, default=8)
     p2.add_argument("--lr", type=float, default=5e-5)
     p2.add_argument("--freeze_first_n", type=int, default=6)
-    p2.add_argument("--block_type", choices=["attention", "mamba"], default="attention",
-                     help="MUST match the block_type used during pretraining of --pretrained_encoder")
-    p2.add_argument("--mamba_d_state", type=int, default=16)
-    p2.add_argument("--mamba_d_conv", type=int, default=4)
-    p2.add_argument("--mamba_expand", type=int, default=2)
     p2.add_argument("--num_workers", type=int, default=4)
     p2.add_argument("--cache_mode", choices=["precomputed", "persistent", "inmemory"],
                      default="precomputed",
@@ -1273,8 +1242,6 @@ if __name__ == "__main__":
             batch_size=args.batch_size, patch_size=args.patch_size, embed_dim=args.embed_dim,
             encoder_depth=args.encoder_depth, encoder_heads=args.encoder_heads, lr=args.lr,
             use_cross_modal=not args.no_cross_modal, resume=args.resume,
-            block_type=args.block_type, mamba_d_state=args.mamba_d_state,
-            mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
             num_workers=args.num_workers, cache_rate=args.cache_rate, cache_dir=args.cache_dir,
             cache_mode=args.cache_mode, force_recache=args.force_recache,
         )
@@ -1284,8 +1251,6 @@ if __name__ == "__main__":
             output_dir=args.output_dir, epochs=args.epochs, batch_size=args.batch_size,
             patch_size=args.patch_size, embed_dim=args.embed_dim, encoder_depth=args.encoder_depth,
             encoder_heads=args.encoder_heads, lr=args.lr, freeze_first_n=args.freeze_first_n,
-            block_type=args.block_type, mamba_d_state=args.mamba_d_state,
-            mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
             num_workers=args.num_workers, cache_rate=args.cache_rate,
             train_cache_dir=args.train_cache_dir, val_cache_dir=args.val_cache_dir,
             num_samples_per_crop=args.num_samples_per_crop,
