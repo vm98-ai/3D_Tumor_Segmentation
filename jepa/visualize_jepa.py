@@ -16,7 +16,6 @@ Usage
         --encoder_ckpt jepa_outputs/pretrained_encoder.pth \
         --cache_pt monai_persistent_cache/pretrain/BraTS-XXX.pt \
         --patch_size 16 --embed_dim 384 --encoder_depth 8 --encoder_heads 8 \
-        --block_type attention \
         --output_dir feature_viz
 
     # or with raw NIfTI:
@@ -148,10 +147,6 @@ def main():
     ap.add_argument("--embed_dim", type=int, default=384)
     ap.add_argument("--encoder_depth", type=int, default=8)
     ap.add_argument("--encoder_heads", type=int, default=8)
-    ap.add_argument("--block_type", choices=["attention", "mamba"], default="attention")
-    ap.add_argument("--mamba_d_state", type=int, default=16)
-    ap.add_argument("--mamba_d_conv", type=int, default=4)
-    ap.add_argument("--mamba_expand", type=int, default=2)
     ap.add_argument("--fg_threshold", type=float, default=1e-6,
                      help="A patch is 'foreground' if the mean |intensity| "
                           "of its voxels (summed across the 4 modalities) "
@@ -191,10 +186,6 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.encoder_depth,
         num_heads=args.encoder_heads,
-        block_type=args.block_type,
-        mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv,
-        mamba_expand=args.mamba_expand,
     ).to(device)
 
     state = torch.load(args.encoder_ckpt, map_location="cpu")
