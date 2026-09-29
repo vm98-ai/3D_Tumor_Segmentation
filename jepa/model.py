@@ -6,17 +6,7 @@
   • SpatialPredictor3D   — narrow transformer that maps context repr
                            + positional mask tokens → predicted target repr
   • CrossModalPredictor  — predicts one modality's repr from another
-  • UNETRDecoder3D       — multi-scale segmentation decoder (NEW)
-
-DECODER UPGRADE (this revision):
-  VisionTransformer3D gained `forward_with_hidden_states`, which returns
-  token sequences from several intermediate blocks (not just the last
-  one). UNETRDecoder3D fuses those multi-depth features + a full-res
-  input skip, progressively upsampling like a U-Net, replacing the old
-  single-scale ConvDecoder3D (which only ever saw the final block's
-  tokens). This is the standard UNETR (Hatamizadeh et al.) architecture,
-  and it maps cleanly onto this encoder since patch_size=16 already
-  matches UNETR's 4-level configuration.
+  • UNETRDecoder3D       — multi-scale segmentation decoder
 """
 
 import math
@@ -105,34 +95,6 @@ class TransformerBlock(nn.Module):
 # ─── Mamba (S6 selective SSM) mixer — alternative to Attention ───────────────
 
 class MambaBlock(nn.Module):
-    """
-    Selective state-space (S6 / "Mamba") sequence mixer, used as a
-    drop-in alternative to Attention. Attention is O(N^2) in the number
-    of tokens; this is O(N), which matters here because shrinking
-    patch_size for finer segmentation detail blows up the token count
-    fast (128^3 volume @ patch_size=8 -> 4096 tokens/sample).
-
-    This is a pure-PyTorch reference implementation of the selective
-    scan (a straightforward per-timestep recurrence) — correct, but the
-    Python-level loop over the sequence length is the throughput
-    bottleneck on GPU. For production-speed training, swap `_scan`'s
-    body for `mamba_ssm.ops.selective_scan_interface.selective_scan_fn`
-    (the official fused CUDA kernel); the parameters/shapes here are
-    laid out to match that kernel's expected inputs directly.
-
-    Spatial data has no privileged left-to-right order the way text
-    does, so — following Vision Mamba (Zhu et al., 2024) — this block
-    scans the token sequence in BOTH directions and averages the two
-    outputs whenever the full (unmasked) sequence is available.
-
-    IMPORTANT — padding safety: when `key_padding_mask` is supplied
-    (JEPA's masked/variable-length context subset, right-padded with
-    zeros), bidirectional scanning is UNSAFE: a backward scan starts at
-    the padded tail and would carry pad-contaminated state into every
-    real token's output. Callers MUST pass bidirectional=False whenever
-    a key_padding_mask is supplied; this is enforced with an assert
-    below rather than silently doing the wrong thing.
-    """
 
     def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2,
                  dt_rank: Optional[int] = None):
@@ -247,17 +209,6 @@ class MambaTransformerBlock(nn.Module):
 # ─── 3D Vision Transformer ───────────────────────────────────────────────────
 
 class VisionTransformer3D(nn.Module):
-    """
-    ViT encoder for 4D BraTS volumes.
-
-    During JEPA pretraining, `forward_subset` is used so the encoder
-    only processes the *visible* (context) tokens. `forward_single_modality`
-    tokenizes and encodes a single modality using a shared 1-channel
-    projection (cross-modal objective). During fine-tuning, `forward`
-    processes all tokens of the full 4-modality stack, and
-    `forward_with_hidden_states` additionally exposes intermediate block
-    outputs for the UNETR-style decoder.
-    """
 
     def __init__(
         self,
@@ -324,19 +275,6 @@ class VisionTransformer3D(nn.Module):
     def forward_with_hidden_states(
         self, x: torch.Tensor, layer_indices: List[int]
     ) -> Dict[int, torch.Tensor]:
-        """
-        Full 4-modality forward pass, but also returns the raw token
-        sequence after each block index in `layer_indices` (1-indexed:
-        1 == output of the first block).
-
-        The deepest requested index gets the final LayerNorm applied
-        (matching what `forward()` returns for the full stack);
-        shallower ones are returned un-normed, matching the original
-        UNETR formulation, which fuses raw intermediate features.
-
-        Used by UNETRDecoder3D to build multi-scale skip connections
-        instead of relying solely on the final block's tokens.
-        """
         tokens = self._tokenize(x, single_modality=False)
         wanted = set(layer_indices)
         last_idx = max(wanted)
@@ -575,13 +513,6 @@ class UpBlock3D(nn.Module):
 
 
 class SkipProjector3D(nn.Module):
-    """
-    Every ViT hidden state lives at the SAME resolution (1/patch_size),
-    since a plain ViT never downsamples between blocks. To fuse an
-    intermediate layer's features at a given decoder stage, this chain
-    of `n_ups` UpBlock3D stages upsamples it from 1/patch_size to that
-    stage's (coarser-than-full) resolution.
-    """
 
     def __init__(self, in_ch: int, out_ch: int, n_ups: int):
         super().__init__()
@@ -598,12 +529,6 @@ class SkipProjector3D(nn.Module):
 
 
 class UNETRDecoder3D(nn.Module):
-    """
-    Fuses ViT features from (n_stages - 1) intermediate depths + one
-    bottleneck (deepest) depth + a raw-input full-resolution skip,
-    progressively upsampling from 1/patch_size resolution back to full
-    resolution. n_stages = log2(patch_size), e.g. 4 for patch_size=16.
-    """
 
     def __init__(
         self,
