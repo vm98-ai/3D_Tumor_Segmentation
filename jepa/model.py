@@ -83,125 +83,8 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, mlp_ratio, drop)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None,
-                bidirectional: bool = True) -> torch.Tensor:
-        # `bidirectional` is accepted-but-unused here so VisionTransformer3D
-        # can call attention and Mamba blocks through one shared code path.
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-# ─── Mamba (S6 selective SSM) mixer — alternative to Attention ───────────────
-
-class MambaBlock(nn.Module):
-
-    def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2,
-                 dt_rank: Optional[int] = None):
-        super().__init__()
-        self.dim = dim
-        self.d_inner = dim * expand
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.dt_rank = dt_rank or max(dim // 16, 1)
-
-        self.in_proj = nn.Linear(dim, self.d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(
-            self.d_inner, self.d_inner, kernel_size=d_conv,
-            groups=self.d_inner, padding=d_conv - 1, bias=True,
-        )
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-
-        # A is parameterised in log-space and kept negative via -exp(),
-        # standard Mamba practice for a stable, always-decaying state.
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))     # [d_inner, d_state]
-        self.D = nn.Parameter(torch.ones(self.d_inner))  # skip/residual gain
-
-        self.out_proj = nn.Linear(self.d_inner, dim, bias=False)
-
-    def _scan(self, x: torch.Tensor, delta: torch.Tensor, A: torch.Tensor,
-              B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-        """
-        Sequential selective-scan recurrence.
-          x, delta: [B, L, d_inner]
-          A:        [d_inner, d_state]           (negative)
-          B, C:     [B, L, d_state]
-        Returns y: [B, L, d_inner]
-        """
-        Bsz, L, d_inner = x.shape
-        d_state = A.shape[1]
-
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)                       # [B,L,d_inner,d_state]
-        deltaB_x = delta.unsqueeze(-1) * B.unsqueeze(2) * x.unsqueeze(-1)  # [B,L,d_inner,d_state]
-
-        h = x.new_zeros(Bsz, d_inner, d_state)
-        ys = []
-        for t in range(L):
-            h = deltaA[:, t] * h + deltaB_x[:, t]
-            ys.append(torch.einsum("bdn,bn->bd", h, C[:, t]))
-        return torch.stack(ys, dim=1)   # [B, L, d_inner]
-
-    def _mixer(self, x: torch.Tensor, reverse: bool) -> torch.Tensor:
-        """One directional pass. x: [B, L, dim] -> [B, L, dim]."""
-        if reverse:
-            x = x.flip(dims=[1])
-
-        xz = self.in_proj(x)                        # [B,L,2*d_inner]
-        x_in, z = xz.chunk(2, dim=-1)
-
-        # Causal depthwise conv for local context, matching original Mamba.
-        x_conv = self.conv1d(x_in.transpose(1, 2))[..., :x_in.shape[1]]
-        x_conv = F.silu(x_conv.transpose(1, 2))       # [B,L,d_inner]
-
-        x_dbl = self.x_proj(x_conv)                   # [B,L,dt_rank+2*d_state]
-        delta, Bm, Cm = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        delta = F.softplus(self.dt_proj(delta))       # [B,L,d_inner]
-        A = -torch.exp(self.A_log)                    # [d_inner,d_state]
-
-        y = self._scan(x_conv, delta, A, Bm, Cm)
-        y = y + x_conv * self.D                        # skip connection
-        y = y * F.silu(z)                               # gate
-        out = self.out_proj(y)
-
-        if reverse:
-            out = out.flip(dims=[1])
-        return out
-
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None,
-                bidirectional: bool = True) -> torch.Tensor:
-        if key_padding_mask is not None:
-            assert not bidirectional, (
-                "Bidirectional Mamba scanning is not padding-safe — a backward "
-                "scan hits padding before real tokens and contaminates every "
-                "output. Pass bidirectional=False whenever key_padding_mask is set."
-            )
-            x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-
-        fwd = self._mixer(x, reverse=False)
-        if not bidirectional:
-            return fwd
-        bwd = self._mixer(x, reverse=True)
-        return 0.5 * (fwd + bwd)
-
-
-class MambaTransformerBlock(nn.Module):
-    """Same pre-norm residual shape as TransformerBlock, but with the
-    Attention mixer swapped for a bidirectional MambaBlock."""
-
-    def __init__(self, dim: int, mlp_ratio: float = 4.0, drop: float = 0.0,
-                 d_state: int = 16, d_conv: int = 4, expand: int = 2):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.mixer = MambaBlock(dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_ratio, drop)
-
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None,
-                bidirectional: bool = True) -> torch.Tensor:
-        x = x + self.mixer(self.norm1(x), key_padding_mask=key_padding_mask,
-                            bidirectional=bidirectional)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -209,8 +92,7 @@ class MambaTransformerBlock(nn.Module):
 # ─── 3D Vision Transformer ───────────────────────────────────────────────────
 
 class VisionTransformer3D(nn.Module):
-
-    def __init__(
+      def __init__(
         self,
         img_size: Tuple[int, int, int] = (128, 128, 128),
         patch_size: int = 16,
@@ -221,32 +103,17 @@ class VisionTransformer3D(nn.Module):
         mlp_ratio: float = 4.0,
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
-        block_type: str = "attention",   # "attention" or "mamba"
-        mamba_d_state: int = 16,
-        mamba_d_conv: int = 4,
-        mamba_expand: int = 2,
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        assert block_type in ("attention", "mamba"), f"unknown block_type: {block_type}"
-        self.block_type = block_type
 
         self.patch_embed = PatchEmbed3D(img_size, patch_size, in_channels, embed_dim)
         self.pos_embed = SinCos3DPosEmbed(embed_dim, self.patch_embed.grid_size)
 
-        if block_type == "attention":
-            self.blocks = nn.ModuleList([
-                TransformerBlock(embed_dim, num_heads, mlp_ratio, drop_rate, attn_drop_rate)
-                for _ in range(depth)
-            ])
-        else:
-            self.blocks = nn.ModuleList([
-                MambaTransformerBlock(
-                    embed_dim, mlp_ratio, drop_rate,
-                    d_state=mamba_d_state, d_conv=mamba_d_conv, expand=mamba_expand,
-                )
-                for _ in range(depth)
-            ])
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, drop_rate, attn_drop_rate)
+            for _ in range(depth)
+        ])
         self.norm = nn.LayerNorm(embed_dim)
 
         self._init_weights()
@@ -317,7 +184,7 @@ class VisionTransformer3D(nn.Module):
             key_padding_mask[b, :t.shape[0]] = False
 
         for block in self.blocks:
-            padded = block(padded, key_padding_mask=key_padding_mask, bidirectional=False)
+            padded = block(padded, key_padding_mask=key_padding_mask)
         padded = self.norm(padded)
 
         out = [padded[b, :ctx_tokens[b].shape[0]] for b in range(B)]
@@ -327,13 +194,7 @@ class VisionTransformer3D(nn.Module):
 # ─── EMA Target Encoder ───────────────────────────────────────────────────────
 
 class EMATargetEncoder(nn.Module):
-    """
-    Maintains an exponential-moving-average copy of the context encoder.
-        θ_target ← τ·θ_target + (1-τ)·θ_online
-    τ is annealed from τ_start → τ_end over training steps.
-    """
-
-    def __init__(
+       def __init__(
         self,
         encoder: VisionTransformer3D,
         tau_start: float = 0.996,
@@ -366,13 +227,7 @@ class EMATargetEncoder(nn.Module):
 # ─── Spatial Predictor ───────────────────────────────────────────────────────
 
 class SpatialPredictor3D(nn.Module):
-    """
-    A narrow transformer that, given context representations + learnable
-    mask tokens with positional embeddings of the target locations,
-    predicts what the target encoder would output at those locations.
-    """
-
-    def __init__(
+      def __init__(
         self,
         encoder_dim: int = 768,
         predictor_dim: int = 384,
@@ -529,8 +384,7 @@ class SkipProjector3D(nn.Module):
 
 
 class UNETRDecoder3D(nn.Module):
-
-    def __init__(
+      def __init__(
         self,
         embed_dim: int,
         grid_size: Tuple[int, int, int],
